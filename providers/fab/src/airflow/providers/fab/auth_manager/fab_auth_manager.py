@@ -31,7 +31,7 @@ from fastapi.middleware.wsgi import WSGIMiddleware
 from flask import current_app, g
 from flask_appbuilder.const import AUTH_DB, AUTH_LDAP
 from sqlalchemy import select
-from sqlalchemy.exc import NoResultFound, SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, joinedload
 
 from airflow.api_fastapi.app import AUTH_MANAGER_FASTAPI_APP_PREFIX
@@ -100,7 +100,7 @@ from airflow.providers.fab.www.security.permissions import (
 )
 from airflow.providers.fab.www.security_appless import ApplessAirflowSecurityManager
 from airflow.providers.fab.www.utils import get_fab_action_from_method_map
-from airflow.utils.session import NEW_SESSION, create_session, provide_session
+from airflow.utils.session import NEW_SESSION, create_session, create_session_async, provide_session
 
 if TYPE_CHECKING:
     from flask import Flask
@@ -310,24 +310,17 @@ class FabAuthManager(BaseAuthManager[User]):
     def session(self):
         return self.appbuilder.session
 
-    @cachedmethod(lambda self: self.cache, key=lambda _, token: int(token["sub"]))
+    def _get_user_id(self, token: dict[str, Any]) -> int:
+        return int(token["sub"])
+
+    @cachedmethod(lambda self: self.cache, key=_get_user_id)
     def deserialize_user(self, token: dict[str, Any]) -> User:
-        user_id = int(token["sub"])
+        user_id = self._get_user_id(token)
 
         def _fetch_user() -> User:
             with create_session() as session:
-                try:
-                    user = session.scalars(select(User).where(User.id == user_id)).one()
-                except NoResultFound:
-                    raise ValueError(f"User with id {token['sub']} not found")
-                # A token stays syntactically valid until it expires, so the account it
-                # names has to be re-checked on every request rather than trusted from
-                # the signature alone. ``is_active`` reads the nullable ``active``
-                # column, and a null is treated as inactive here for the same reason it
-                # is on the password path in ``auth_user_db``.
-                if not user.is_active:
-                    raise ValueError(f"User with id {token['sub']} is not active")
-                return user
+                user = session.scalars(select(User).where(User.id == user_id)).one_or_none()
+                return self._ensure_active_user(user, token)
 
         try:
             return _fetch_user()
@@ -344,6 +337,29 @@ class FabAuthManager(BaseAuthManager[User]):
                 with suppress(Exception):
                     self.session.remove()
                 raise
+
+    async def adeserialize_user(self, token: dict[str, Any]) -> User:
+        user_id = self._get_user_id(token)
+        if (user := self.cache.get(user_id)) is not None:
+            return user
+        async with create_session_async() as session:
+            user = await session.scalar(select(User).where(User.id == user_id))
+        user = self._ensure_active_user(user, token)
+        self.cache[user_id] = user
+        return user
+
+    @staticmethod
+    def _ensure_active_user(user: User | None, token: dict[str, Any]) -> User:
+        if user is None:
+            raise ValueError(f"User with id {token['sub']} not found")
+        # A token stays syntactically valid until it expires, so the account it
+        # names has to be re-checked on every request rather than trusted from
+        # the signature alone. ``is_active`` reads the nullable ``active``
+        # column, and a null is treated as inactive here for the same reason it
+        # is on the password path in ``auth_user_db``.
+        if not user.is_active:
+            raise ValueError(f"User with id {token['sub']} is not active")
+        return user
 
     def serialize_user(self, user: User) -> dict[str, Any]:
         return {"sub": str(user.id)}

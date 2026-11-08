@@ -27,6 +27,7 @@ from urllib.parse import urlencode
 import pytest
 from flask import g
 from flask_appbuilder.const import AUTH_DB, AUTH_LDAP, AUTH_OAUTH, AUTH_REMOTE_USER
+from sqlalchemy import event
 from sqlalchemy.exc import OperationalError, PendingRollbackError
 from sqlalchemy.orm import Session
 
@@ -41,7 +42,7 @@ from airflow.utils.db import resetdb
 
 from tests_common.test_utils.asserts import assert_queries_count
 from tests_common.test_utils.config import conf_vars
-from unit.fab.auth_manager.test_utils import create_user, delete_user
+from unit.fab.auth_manager.test_utils import create_user, delete_role, delete_user
 
 with suppress(ImportError):
     from airflow.api_fastapi.auth.managers.models.resource_details import (
@@ -1295,7 +1296,7 @@ class TestDeserializeUserSessionCleanup:
         user.id = 99996
         original_exc = OperationalError("connection dropped", None, Exception())
         retry_query_result = Mock()
-        retry_query_result.one.return_value = user
+        retry_query_result.one_or_none.return_value = user
 
         mock_session = MagicMock(spec=["scalars", "remove"])
         mock_session.scalars.side_effect = [original_exc, retry_query_result]
@@ -1307,6 +1308,88 @@ class TestDeserializeUserSessionCleanup:
         assert result == user
         assert mock_session.scalars.call_count == 2
         mock_session.remove.assert_called_once()
+
+
+@contextmanager
+def assert_no_sync_engine_queries():
+    """Fail if the block sends a statement through the sync engine, which blocks the event loop it runs on."""
+    statements: list[str] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(settings.engine, "before_cursor_execute", record)
+    try:
+        yield
+    finally:
+        event.remove(settings.engine, "before_cursor_execute", record)
+    assert statements == []
+
+
+@pytest.mark.db_test
+class TestAdeserializeUser:
+    @pytest.fixture(autouse=True)
+    def clean_up(self, flask_app, auth_manager_with_appbuilder):
+        auth_manager_with_appbuilder.cache.clear()
+        yield
+        auth_manager_with_appbuilder.cache.clear()
+        delete_user(flask_app, "adeserialize_user")
+        delete_user(flask_app, "adeserialize_inactive_user")
+        delete_role(flask_app, "adeserialize_user_role")
+
+    @pytest.mark.asyncio
+    async def test_loads_user_off_the_sync_engine_and_caches_it(
+        self, flask_app, auth_manager_with_appbuilder
+    ):
+        user = create_user(
+            flask_app,
+            "adeserialize_user",
+            role_name="adeserialize_user_role",
+            permissions=[(ACTION_CAN_READ, RESOURCE_DAG)],
+        )
+        token = {"sub": str(user.id)}
+
+        with assert_no_sync_engine_queries():
+            result = await auth_manager_with_appbuilder.adeserialize_user(token)
+
+        # The async session is closed by now, so the permissions must already be loaded.
+        with assert_queries_count(0):
+            assert await auth_manager_with_appbuilder.adeserialize_user(token) is result
+            assert auth_manager_with_appbuilder.deserialize_user(token) is result
+            permissions = {
+                (permission.action.name, permission.resource.name)
+                for role in result.roles
+                for permission in role.permissions
+            }
+        assert permissions == {(ACTION_CAN_READ, RESOURCE_DAG)}
+
+    @pytest.mark.parametrize("active", [False, None])
+    @pytest.mark.asyncio
+    async def test_rejects_inactive_user_without_caching(
+        self, active, flask_app, auth_manager_with_appbuilder
+    ):
+        user = create_user(flask_app, "adeserialize_inactive_user")
+        user_id = user.id
+        user.active = active
+        auth_manager_with_appbuilder.session.commit()
+
+        with (
+            assert_no_sync_engine_queries(),
+            pytest.raises(ValueError, match=f"User with id {user_id} is not active"),
+        ):
+            await auth_manager_with_appbuilder.adeserialize_user({"sub": str(user_id)})
+
+        assert user_id not in auth_manager_with_appbuilder.cache
+
+    @pytest.mark.asyncio
+    async def test_rejects_unknown_user_without_caching(self, auth_manager_with_appbuilder):
+        with (
+            assert_no_sync_engine_queries(),
+            pytest.raises(ValueError, match="User with id 99999 not found"),
+        ):
+            await auth_manager_with_appbuilder.adeserialize_user({"sub": "99999"})
+
+        assert 99999 not in auth_manager_with_appbuilder.cache
 
 
 class TestFabAuthManagerSessionCleanup:
