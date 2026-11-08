@@ -318,6 +318,29 @@ class TestBaseAuthManager:
         signer.avalidated_claims.assert_called_once_with(token)
         assert result == user
 
+    @patch.object(EmptyAuthManager, "deserialize_user", autospec=True)
+    @patch.object(EmptyAuthManager, "adeserialize_user", autospec=True)
+    @patch(
+        "airflow.api_fastapi.auth.managers.base_auth_manager.BaseAuthManager._get_token_validator",
+        autospec=True,
+    )
+    @pytest.mark.asyncio
+    async def test_get_user_from_token_awaits_adeserialize_user(
+        self, mock__get_token_validator, mock_adeserialize_user, mock_deserialize_user, auth_manager
+    ):
+        payload = {"sub": "test"}
+        user = BaseAuthManagerUserTest(name="test")
+        signer = AsyncMock(spec=JWTValidator)
+        signer.avalidated_claims.return_value = payload
+        mock__get_token_validator.return_value = signer
+        mock_adeserialize_user.return_value = user
+
+        result = await auth_manager.get_user_from_token("token")
+
+        assert result == user
+        mock_adeserialize_user.assert_awaited_once_with(auth_manager, payload)
+        mock_deserialize_user.assert_not_called()
+
     @patch(
         "airflow.models.revoked_token.RevokedToken.is_revoked",
         return_value=True,

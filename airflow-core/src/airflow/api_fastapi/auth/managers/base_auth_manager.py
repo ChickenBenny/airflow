@@ -147,6 +147,14 @@ class BaseAuthManager(Generic[T], LoggingMixin, metaclass=ABCMeta):
     def deserialize_user(self, token: dict[str, Any]) -> T:
         """Create a user object from dict."""
 
+    async def adeserialize_user(self, token: dict[str, Any]) -> T:
+        """
+        Create a user object from dict on the API server event loop.
+
+        Defaults to ``deserialize_user``. Override it if that method does blocking I/O.
+        """
+        return self.deserialize_user(token)
+
     @abstractmethod
     def serialize_user(self, user: T) -> dict[str, Any]:
         """Create a subject and extra claims dict from a user object."""
@@ -168,7 +176,7 @@ class BaseAuthManager(Generic[T], LoggingMixin, metaclass=ABCMeta):
             raise InvalidTokenError("Token has been revoked")
 
         try:
-            return self.deserialize_user(payload)
+            return await self.adeserialize_user(payload)
         except (ValueError, KeyError) as e:
             log.error("Couldn't deserialize user from token, JWT token is not valid: %s", e)
             raise InvalidTokenError(str(e))
